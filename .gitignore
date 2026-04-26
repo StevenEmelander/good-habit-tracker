@@ -1,0 +1,11 @@
+.netlify/
+node_modules/
+backups/
+.DS_Store
+.env
+.env.*
+infrastructure/dist/
+infrastructure/cdk.out/
+infrastructure/cdk.context.json
+.cdk-gen/
+*.js.map
