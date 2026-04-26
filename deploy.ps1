@@ -27,9 +27,11 @@ try {
   Write-Host "Deploying stack..."
   npx cdk deploy --all --require-approval never --context "unlock_token=$UnlockToken"
 
+  $enc = [System.Uri]::EscapeDataString($UnlockToken)
   Write-Host ""
   Write-Host "Done."
-  Write-Host "  Unlock once per browser (bookmark): ${BaseUrl}/?unlock=${UnlockToken}"
+  Write-Host "  Unlock (bookmark on each device): ${BaseUrl}/?unlock=${UnlockToken}"
+  Write-Host "  If '+' or '/' breaks on iPhone, use encoded: ${BaseUrl}/?unlock=${enc}"
 }
 finally {
   Pop-Location

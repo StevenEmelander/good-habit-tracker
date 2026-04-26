@@ -17,6 +17,35 @@ function getCookies(request) {
   return result;
 }
 
+/** CloudFront passes application/x-www-form-urlencoded style querystrings. URLSearchParams treats '+' as a space, which breaks base64-like unlock tokens that contain '+'. */
+function getUnlockTokenRaw(querystring) {
+  if (!querystring) return null;
+  const needle = 'unlock=';
+  const start = querystring.indexOf(needle);
+  if (start === -1) return null;
+  let i = start + needle.length;
+  const amp = querystring.indexOf('&', i);
+  const end = amp === -1 ? querystring.length : amp;
+  const enc = querystring.slice(i, end);
+  try {
+    return decodeURIComponent(enc);
+  } catch (_) {
+    return enc;
+  }
+}
+
+function removeUnlockParam(querystring) {
+  if (!querystring) return '';
+  return querystring
+    .split('&')
+    .filter((p) => {
+      const eq = p.indexOf('=');
+      const k = eq >= 0 ? p.slice(0, eq) : p;
+      return k !== 'unlock';
+    })
+    .join('&');
+}
+
 exports.handler = async (event) => {
   const request = event.Records[0].cf.request;
   const cookies = getCookies(request);
@@ -24,36 +53,30 @@ exports.handler = async (event) => {
   // Valid auth cookie — pass through
   if (cookies['htok'] === UNLOCK_HASH) {
     if (request.querystring && request.querystring.includes('unlock=')) {
-      const params = new URLSearchParams(request.querystring);
-      params.delete('unlock');
-      request.querystring = params.toString();
+      request.querystring = removeUnlockParam(request.querystring);
     }
     return request;
   }
 
   // Unlock via querystring: ?unlock=<token>
-  if (request.querystring) {
-    const params = new URLSearchParams(request.querystring);
-    const tok = params.get('unlock');
-    if (tok) {
-      const tokHash = crypto.createHash('sha256').update(tok).digest('hex');
-      if (tokHash === UNLOCK_HASH) {
-        params.delete('unlock');
-        const qs = params.toString();
-        const dest = request.uri + (qs ? '?' + qs : '');
-        return {
-          status: '302',
-          statusDescription: 'Found',
-          headers: {
-            location: [{ key: 'Location', value: dest }],
-            'set-cookie': [{
-              key: 'Set-Cookie',
-              value: 'htok=' + UNLOCK_HASH + '; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Strict',
-            }],
-            'cache-control': [{ key: 'Cache-Control', value: 'no-store, no-cache' }],
-          },
-        };
-      }
+  const tok = getUnlockTokenRaw(request.querystring || '');
+  if (tok) {
+    const tokHash = crypto.createHash('sha256').update(tok).digest('hex');
+    if (tokHash === UNLOCK_HASH) {
+      const qs = removeUnlockParam(request.querystring || '');
+      const dest = request.uri + (qs ? '?' + qs : '');
+      return {
+        status: '302',
+        statusDescription: 'Found',
+        headers: {
+          location: [{ key: 'Location', value: dest }],
+          'set-cookie': [{
+            key: 'Set-Cookie',
+            value: 'htok=' + UNLOCK_HASH + '; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Lax',
+          }],
+          'cache-control': [{ key: 'Cache-Control', value: 'no-store, no-cache' }],
+        },
+      };
     }
   }
 
@@ -62,9 +85,8 @@ exports.handler = async (event) => {
     statusDescription: 'Forbidden',
     headers: {
       'content-type': [{ key: 'Content-Type', value: 'text/html; charset=utf-8' }],
-      'cache-control': [{ key: 'Cache-Control', value: 'no-store' }],
+      'cache-control': [{ key: 'Cache-Control', value: 'no-store, no-cache, private' }],
     },
     body: '<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>private</title><style>body{background:#0a0a0b;color:#4a4a55;font-family:ui-monospace,monospace;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;font-size:13px;letter-spacing:0.1em}</style></head><body>private</body></html>',
   };
 };
-

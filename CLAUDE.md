@@ -82,7 +82,9 @@ CloudFormation **cannot change** a cross-stack export value while `GoodHabitTrac
 
 ### Unlock links on phones
 
-If the token contains `+` or `/`, the query string must be **percent-encoded** when pasted into a browser or Messages, or the server will see the wrong token.
+Deploy scripts print an **encoded** unlock URL as well as the raw token. The Edge auth handler parses `unlock=` with `decodeURIComponent` only (it does **not** use `URLSearchParams`, which treats `+` as a space and breaks common random tokens).
+
+The auth cookie uses **`SameSite=Lax`** so Safari/iOS can set it reliably on redirect from the unlock link.
 
 ## When making changes
 
