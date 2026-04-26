@@ -52,6 +52,38 @@ UNLOCK_TOKEN=your-secret-token ./deploy.sh
 
 Or `deploy.ps1` on Windows. Scripts echo the bookmarkable unlock URL; they do not rely on CloudFormation outputs for the secret.
 
+### Updating Lambda@Edge auth (cross-region export)
+
+CloudFormation **cannot change** a cross-stack export value while `GoodHabitTracker` still imports it (the Edge Lambda version ARN). If only the auth Lambda code or hash substitution changes, use a **three-step** deploy with `--exclusively` so CDK does not try to update the cert stack before the main stack releases the import:
+
+1. **Drop Edge on CloudFront** (site is briefly **not** gated — keep this window short):
+
+   ```bash
+   cd infrastructure
+   npx cdk deploy GoodHabitTracker --exclusively --require-approval never \
+     --context unlock_token="$UNLOCK_TOKEN" --context temp_drop_edge_auth=true
+   ```
+
+2. **Update the cert stack** (new `AuthFn` code / version export):
+
+   ```bash
+   npx cdk deploy GoodHabitTrackerCert --exclusively --require-approval never \
+     --context unlock_token="$UNLOCK_TOKEN"
+   ```
+
+3. **Re-attach Edge** on the distribution:
+
+   ```bash
+   npx cdk deploy GoodHabitTracker --exclusively --require-approval never \
+     --context unlock_token="$UNLOCK_TOKEN"
+   ```
+
+`cert-stack.ts` injects the unlock digest by replacing the single line `const UNLOCK_HASH = '__UNLOCK_HASH__';` in `lambdas/auth/index.js` — do not put `__UNLOCK_HASH__` in comments or the wrong substring may be substituted.
+
+### Unlock links on phones
+
+If the token contains `+` or `/`, the query string must be **percent-encoded** when pasted into a browser or Messages, or the server will see the wrong token.
+
 ## When making changes
 
 1. App behavior → `app/tracker.html` only (unless infra must change for the same feature).

@@ -1,7 +1,7 @@
 'use strict';
 const crypto = require('crypto');
 
-// __UNLOCK_HASH__ is replaced when the CDK cert stack builds the Lambda asset (see infrastructure/lib/cert-stack.ts).
+// Unlock hash is injected by CDK at deploy time (see infrastructure/lib/cert-stack.ts).
 const UNLOCK_HASH = '__UNLOCK_HASH__';
 
 function getCookies(request) {
@@ -67,3 +67,4 @@ exports.handler = async (event) => {
     body: '<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>private</title><style>body{background:#0a0a0b;color:#4a4a55;font-family:ui-monospace,monospace;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;font-size:13px;letter-spacing:0.1em}</style></head><body>private</body></html>',
   };
 };
+

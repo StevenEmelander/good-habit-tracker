@@ -59,10 +59,12 @@ export class GoodHabitTrackerStack extends cdk.Stack {
     bucket.grantRead(oai);
 
     // ── CloudFront ────────────────────────────────────────────────────────────
-    const authEdge: cloudfront.EdgeLambda = {
-      functionVersion: props.authFnVersion,
-      eventType: cloudfront.LambdaEdgeEventType.VIEWER_REQUEST,
-    };
+    // Two-phase deploy only: `--context temp_drop_edge_auth=true` drops Edge associations so
+    // GoodHabitTrackerCert can publish a new Lambda@Edge version (exports cannot update while imported).
+    const dropEdgeAuth = this.node.tryGetContext('temp_drop_edge_auth') === 'true';
+    const edgeLambdas: cloudfront.EdgeLambda[] | undefined = dropEdgeAuth
+      ? undefined
+      : [{ functionVersion: props.authFnVersion, eventType: cloudfront.LambdaEdgeEventType.VIEWER_REQUEST }];
 
     const apiOriginRequestPolicy = new cloudfront.OriginRequestPolicy(this, 'ApiORP', {
       headerBehavior: cloudfront.OriginRequestHeaderBehavior.allowList('Content-Type'),
@@ -78,7 +80,7 @@ export class GoodHabitTrackerStack extends cdk.Stack {
         origin: new origins.S3Origin(bucket, { originAccessIdentity: oai }),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
-        edgeLambdas: [authEdge],
+        ...(edgeLambdas ? { edgeLambdas } : {}),
       },
       additionalBehaviors: {
         '/api/*': {
@@ -90,7 +92,7 @@ export class GoodHabitTrackerStack extends cdk.Stack {
           allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
           cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
           originRequestPolicy: apiOriginRequestPolicy,
-          edgeLambdas: [authEdge],
+          ...(edgeLambdas ? { edgeLambdas } : {}),
         },
       },
     });

@@ -33,10 +33,15 @@ export class CertStack extends cdk.Stack {
     const authTemplate = fs.readFileSync(
       path.join(__dirname, '../lambdas/auth/index.js'), 'utf8'
     );
-    fs.writeFileSync(
-      path.join(authSrcDir, 'index.js'),
-      authTemplate.replace('__UNLOCK_HASH__', unlockHash)
+    // Replace only the constant line so a stray "__UNLOCK_HASH__" in a comment cannot steal the substitution.
+    const authOut = authTemplate.replace(
+      "const UNLOCK_HASH = '__UNLOCK_HASH__';",
+      `const UNLOCK_HASH = '${unlockHash}';`
     );
+    if (authOut.includes('__UNLOCK_HASH__')) {
+      throw new Error('Auth template still contains __UNLOCK_HASH__ after substitution');
+    }
+    fs.writeFileSync(path.join(authSrcDir, 'index.js'), authOut);
 
     const authFn = new lambda.Function(this, 'AuthFn', {
       functionName: 'good-habit-tracker-auth',
