@@ -29,9 +29,7 @@ try {
 
   $enc = [System.Uri]::EscapeDataString($UnlockToken)
   Write-Host ""
-  Write-Host "Done."
-  Write-Host "  Unlock (bookmark on each device): ${BaseUrl}/?unlock=${UnlockToken}"
-  Write-Host "  If '+' or '/' breaks on iPhone, use encoded: ${BaseUrl}/?unlock=${enc}"
+  Write-Host "Done. Unlock (bookmark this URL): ${BaseUrl}/?unlock=${enc}"
 }
 finally {
   Pop-Location

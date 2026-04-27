@@ -27,10 +27,18 @@ export class GoodHabitTrackerStack extends cdk.Stack {
     }
     const cfSecret = crypto.createHash('sha256').update('cf-secret:' + unlockToken).digest('hex').slice(0, 32);
 
-    // ── DynamoDB ──────────────────────────────────────────────────────────────
-    const table = new dynamodb.Table(this, 'StateTable', {
-      tableName: 'good-habit-tracker-state',
+    // ── DynamoDB: cycle definitions (date ranges, categories, habits/scoring) + daily check-ins ─
+    const cyclesTable = new dynamodb.Table(this, 'CyclesTable', {
+      tableName: 'good-habit-tracker-cycles',
+      partitionKey: { name: 'id', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+    /** One partition `DAY`, sort key ISO date — supports Query by range (no full table Scans on read). */
+    const checkinsTable = new dynamodb.Table(this, 'CheckinsTable', {
+      tableName: 'good-habit-tracker-day-checkins',
       partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'dateKey', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
@@ -41,10 +49,15 @@ export class GoodHabitTrackerStack extends cdk.Stack {
       runtime: lambda.Runtime.NODEJS_20_X,
       handler: 'index.handler',
       code: lambda.Code.fromAsset(path.join(__dirname, '../lambdas/sync')),
-      environment: { TABLE_NAME: table.tableName, CF_SECRET: cfSecret },
-      timeout: cdk.Duration.seconds(10),
+      environment: {
+        CYCLES_TABLE_NAME: cyclesTable.tableName,
+        CHECKINS_TABLE_NAME: checkinsTable.tableName,
+        CF_SECRET: cfSecret,
+      },
+      timeout: cdk.Duration.seconds(45),
     });
-    table.grantReadWriteData(syncFn);
+    cyclesTable.grantReadWriteData(syncFn);
+    checkinsTable.grantReadWriteData(syncFn);
 
     const syncUrl = syncFn.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE });
     const syncDomain = cdk.Fn.select(2, cdk.Fn.split('/', syncUrl.url));
@@ -69,7 +82,8 @@ export class GoodHabitTrackerStack extends cdk.Stack {
     const apiOriginRequestPolicy = new cloudfront.OriginRequestPolicy(this, 'ApiORP', {
       headerBehavior: cloudfront.OriginRequestHeaderBehavior.allowList('Content-Type'),
       cookieBehavior: cloudfront.OriginRequestCookieBehavior.none(),
-      queryStringBehavior: cloudfront.OriginRequestQueryStringBehavior.none(),
+      // Sync uses ?from=YYYY-MM-DD&to=YYYY-MM-DD for ranged check-in loads.
+      queryStringBehavior: cloudfront.OriginRequestQueryStringBehavior.all(),
     });
 
     const distribution = new cloudfront.Distribution(this, 'Distribution', {
@@ -77,7 +91,7 @@ export class GoodHabitTrackerStack extends cdk.Stack {
       certificate: props.cert,
       defaultRootObject: 'tracker.html',
       defaultBehavior: {
-        origin: new origins.S3Origin(bucket, { originAccessIdentity: oai }),
+        origin: origins.S3BucketOrigin.withOriginAccessIdentity(bucket, { originAccessIdentity: oai }),
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
         ...(edgeLambdas ? { edgeLambdas } : {}),

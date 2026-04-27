@@ -19,6 +19,4 @@ npx cdk deploy --all \
 BASE_URL="${BASE_URL:-https://ght.vexom.io}"
 ENC="$(node -e "console.log(encodeURIComponent(process.argv[1]))" "${UNLOCK_TOKEN}")"
 echo ""
-echo "✓ Done."
-echo "  Unlock (bookmark on each device): ${BASE_URL}/?unlock=${UNLOCK_TOKEN}"
-echo "  If '+' or '/' breaks on iPhone, use encoded: ${BASE_URL}/?unlock=${ENC}"
+echo "✓ Done. Unlock (bookmark this URL): ${BASE_URL}/?unlock=${ENC}"

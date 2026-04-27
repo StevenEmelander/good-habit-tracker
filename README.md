@@ -2,14 +2,14 @@
 
 Single-page **habit tracker** (vanilla HTML/JS) with **AWS CDK** infrastructure: CloudFront, S3, Lambda@Edge (cookie / unlock-link gate), Lambda function URL + DynamoDB for sync. Mobile-first dark UI.
 
-**License:** [MIT](./LICENSE) · **Security:** [SECURITY.md](./SECURITY.md) · **Contributing:** [CONTRIBUTING.md](./CONTRIBUTING.md)
+**License:** [MIT](./LICENSE) · **Changelog:** [CHANGELOG.md](./CHANGELOG.md) · **Security:** [SECURITY.md](./SECURITY.md) · **Contributing:** [CONTRIBUTING.md](./CONTRIBUTING.md)
 
 ## Features
 
 - User-defined categories and habits, points per habit, 14-day cycles (tunable)
-- Today / trends / tune tabs; JSON backup and CSV export
+- Today / trends / tune tabs
 - Cloud-only persistence (`GET` / `POST /api/sync`); no tracker data in `localStorage`
-- Minimal footprint (single DynamoDB item, small Lambdas)
+- DynamoDB: cycle row + per-day check-ins (range `GET /api/sync?from=&to=`), partial `POST` for edits
 
 ## Repository layout
 
