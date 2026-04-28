@@ -1,6 +1,6 @@
 {
   "name": "good-habit-tracker-infrastructure",
-  "version": "0.3.0",
+  "version": "0.3",
   "private": true,
   "license": "MIT",
   "scripts": {
