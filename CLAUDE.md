@@ -10,14 +10,30 @@ A self-contained **single-file** web app (`app/tracker.html`) plus a small **AWS
 
 1. **Single-file HTML only** (`app/tracker.html`). Inline CSS/JS. No external CSS, frameworks, or CDN dependencies for the app shell.
 
-2. **Cloud is the source of truth.** No `localStorage` for tracker payload. Boot uses `GET /api/sync?from=…&to=…` (defaults to ~730d if omitted); edits debounce to `POST /api/sync`. Wire JSON: `checkinsByDate`, `cycles`, `_lastModified`; GET may also return `checkinBounds` `{ min, max }`. **POST** accepts `partial: true` with only changed days in `checkinsByDate` plus `deletedCheckinDates[]`; omit `partial` or set `partial: false` to replace all check-in rows from the payload (advanced / tooling). DynamoDB: **`good-habit-tracker-cycles`** (one item: `cycles` JSON + `_lastModified` + optional `checkinDateMin`/`checkinDateMax`) and **`good-habit-tracker-day-checkins`** (`pk = DAY`, `dateKey` sort key for **Query** by date range).
+2. **Cloud is the source of truth.** No `localStorage` for tracker payload. The API is per-item REST under `/api/*`, gated by the CloudFront `X-CF-Secret` header (the lambda rejects anything missing it).
 
-   Schema:
+   **Routes:**
+   - `GET /api/cycles` → `{ cycles: [...], entryBounds: { min, max } }` — one DDB `GetItem` on the cycles row.
+   - `GET /api/cycles/:cycleId` → one cycle object or 404.
+   - `PUT /api/cycles/:cycleId` body `{ startDate, endDate, lengthDays, categories, habitDefinitions }` → `{ ok, removedHabitIds }`. Server reads the cycles row, replaces the named cycle, writes it back, then sweeps any habit ids no cycle defines anymore from every entry row. The returned `removedHabitIds` lets the front-end mirror that sweep locally without a second fetch.
+   - `DELETE /api/cycles/:cycleId` → same shape; sweeps orphans.
+   - `GET /api/entries` → `{ entries: { dateKey: habitValuesById } }` — one paginated `Query pk='DAY'` (no SK condition; partition-targeted, never a Scan).
+   - `GET /api/entries/:dateKey` → one entry or 404.
+   - `PUT /api/entries/:dateKey` body `{ habitValuesById }` → `{ ok }`. If `habitValuesById` is empty, the row is deleted instead. Bounds (`entryDateMin`/`entryDateMax` on the cycles row) are bumped via conditional `UpdateItem` only when the new date extends them.
+   - `DELETE /api/entries/:dateKey` → `{ ok }`. Recomputes bounds via two `Query Limit:1` reads (asc/desc) only when the deleted date was a current bound.
 
-   - `checkinsByDate` — per-date entries with `habitValuesById` (removing a habit purges its id from all dates once that id no longer appears in **any** cycle’s `habitDefinitions`, so cloned cycles keep the same id until the last copy is removed)
-   - `cycles[]` — each cycle: `startDate` / `endDate`, `lengthDays`, `categories[]`, `habitDefinitions[]` (boolean or count habits with `scoring` / point rules)
+   **Boot** is two parallel calls — `GET /api/cycles` + `GET /api/entries`. No date-range parameters anywhere. **Edits** debounce per item: `pushCycle(id)` and `pushEntry(date)` each at 1500ms, keyed by id/date so concurrent edits to different items don't collide.
 
-3. **Privacy / telemetry.** No analytics, no third-party fonts or icons, no extra “phone home” beyond your own origin and `/api/sync`.
+   **DynamoDB tables:**
+   - `good-habit-tracker-cycles` — one row, `id="main"`, attrs `cyclesJson`, `entryDateMin`, `entryDateMax`, `updatedAt`. (The physical table name keeps `cycles` in it; the row holds both the cycle definitions and the entry-date bounds.)
+   - `good-habit-tracker-day-checkins` — `pk='DAY'`, `dateKey` SK, attr `valuesJson`. The physical table name keeps `day-checkins` in it for historical reasons; the lambda code refers to it as the entries table.
+
+   **Schema:**
+
+   - per-entry `habitValuesById` — `{ habitId: boolean | number }`. A habit id with no defining cycle is stripped from every entry by the server sweep on the next cycle PUT/DELETE.
+   - per-cycle `{ id, startDate, endDate, lengthDays, categories[], habitDefinitions[] }`. Habits are boolean or count with `scoring` / point rules. Cloned cycles keep the same habit id until the last copy is removed.
+
+3. **Privacy / telemetry.** No analytics, no third-party fonts or icons, no extra “phone home” beyond your own origin and `/api/cycles` + `/api/entries`.
 
 4. **Deploy secrets.** `unlock_token` is passed only at deploy/synth (`--context unlock_token=...`). Never commit it. Stack outputs must **not** embed the raw token (use deploy scripts to print `https://…/?unlock=…` locally).
 
@@ -27,7 +43,13 @@ A self-contained **single-file** web app (`app/tracker.html`) plus a small **AWS
 
 Vanilla JS. Rebuilds DOM from `state` on change; `data-action` delegation on `document.body`.
 
-Useful symbols: `render`, `renderToday`, `renderTrends`, `renderTune`, `save`, `load`, `schedulePush`, `syncFromCloud`, `getCurrentCycle`, `getUpcomingCycle`, `cycleInfo`, `stripLegacyRestFromCheckins`.
+Source files under `app/scripts/`:
+- `core.js` — state, helpers (`render`, `getCurrentCycle`, `getUpcomingCycle`, `cycleInfo`, `entryFor`, `pushCycle`, `pushEntry`, `applyOrphanSweepLocally`, `normalizeFirstCycleStartFromEntries`, `hasAnyEntries`).
+- `entry-ui.js` — `renderEntry` (the per-day entry tab).
+- `trends-ui.js` — `renderTrends`.
+- `plan-ui.js` — `renderPlan`, `renderAddHabitModal` (the cycle-editor tab).
+- `sync.js` — `bootSync`, debounced per-item `pushCycle`/`pushEntry`.
+- `handlers.js` — single `data-action` click delegate.
 
 ### Infrastructure (`infrastructure/`)
 
@@ -53,6 +75,8 @@ UNLOCK_TOKEN=your-secret-token ./deploy.sh
 Or `deploy.ps1` on Windows. Scripts echo the bookmarkable unlock URL; they do not rely on CloudFormation outputs for the secret.
 
 **Legacy DynamoDB:** Older stacks used `good-habit-tracker-state` (and possibly `habit-tracker-state`). After migrating to `good-habit-tracker-cycles` + `good-habit-tracker-day-checkins`, remove any **retained** old tables in **us-west-2** from the AWS console if CloudFormation left them behind.
+
+**Backups:** `scripts/backup.ps1` (or `backup.sh`) reads `UNLOCK_TOKEN` from env, computes the `htok` cookie hash, calls `GET /api/cycles` + `GET /api/entries`, and writes a single timestamped JSON file to `backups/`. Run before any risky deploy or schema change.
 
 ### Lambda@Edge auth updates (export deadlock)
 

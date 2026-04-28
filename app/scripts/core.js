@@ -1,43 +1,46 @@
-import { renderToday } from './today-ui.js';
+import { renderEntry } from './entry-ui.js';
 import { renderTrends } from './trends-ui.js';
-import { renderTune, renderAddHabitModal } from './tune-ui.js';
+import { renderPlan, renderAddHabitModal } from './plan-ui.js';
 
-export const SYNC_URL = '/api/sync';
+export const API_CYCLES = '/api/cycles';
+export const API_ENTRIES = '/api/entries';
 
 export const state = {
-  checkinsByDate: {},
+  /** dateKey → { habitValuesById }. Filled at boot from GET /api/entries. */
+  entriesByDate: {},
+  /** Cycle definitions, sorted by startDate. Filled at boot from GET /api/cycles. */
   cycles: [],
-  tab: 'today',
-  tuneMode: 'current',
-  /** YYYY-MM-DD for the Today tab; never after calendar today. */
+  tab: 'entry',
+  planMode: 'current',
+  /** YYYY-MM-DD displayed in the entry tab; clamped to [first cycle start, today]. */
   viewDate: null,
-  _lastModified: 0,
   cloudReady: false,
-  /** Dates touched since last successful POST (partial sync). */
-  _dirtyCheckinDates: {},
-  _deletedCheckinDates: [],
-  /** Inclusive range of dates currently merged from the server. */
-  _loadedRange: null,
-  /** Server-reported bounds of stored check-ins (may be null until data exists). */
-  checkinBounds: null,
+  /** Per-item dirty tracking. cycleId → true; dateKey → true. */
+  _dirtyCycleIds: {},
+  _dirtyEntryDates: {},
+  _deletedEntryDates: [],
+  /** Server-reported bounds of stored entries (may be null until data exists). */
+  entryBounds: null,
   /** Trends tab: cycle / month / year / all-time (not rolling “last N days”). */
   trendsMode: 'cycle',
   /** 0 = period containing today for cycle/month/year; ignored for all. */
   trendsStep: 0,
-  /** TUNE: new habit alert — { categoryId, kind?: 'boolean'|'count' }. */
+  /** Plan: new habit alert — { categoryId, kind?: 'boolean'|'count' }. */
   addHabitDraft: null,
 };
 
-export function hasAnyCheckins() {
-  return Object.keys(state.checkinsByDate || {}).length > 0;
+export function hasAnyEntries() {
+  return Object.keys(state.entriesByDate || {}).length > 0;
 }
 
 let syncStatus = 'idle';
 let toastTimer = null;
-let schedulePushImpl = () => {};
+let pushCycleImpl = () => {};
+let pushEntryImpl = () => {};
 
-export function registerSchedulePush(fn) {
-  schedulePushImpl = typeof fn === 'function' ? fn : () => {};
+export function registerPushers(pushCycle, pushEntry) {
+  pushCycleImpl = typeof pushCycle === 'function' ? pushCycle : () => {};
+  pushEntryImpl = typeof pushEntry === 'function' ? pushEntry : () => {};
 }
 
 export function setSyncStatus(next) {
@@ -49,14 +52,12 @@ export function uid(p) { return p + '_' + Math.random().toString(36).slice(2, 7)
 export function fmtDate(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
 export function todayKey() { return fmtDate(new Date()); }
 
-/** Sort cycles, return first cycle’s start (or today if none). */
 export function firstCycleStartKey() {
   sortCycles();
   const c = state.cycles[0];
   return c ? c.startDate : todayKey();
 }
 
-/** Active calendar day for Today tab: clamped to [min(first start, today), today]. */
 export function viewDayKey() {
   const t = todayKey();
   const lo = firstCycleStartKey();
@@ -68,49 +69,29 @@ export function viewDayKey() {
 }
 
 export function addDaysKey(k, n) { const d = new Date(k + 'T00:00:00'); d.setDate(d.getDate() + n); return fmtDate(d); }
-export function rangeFullyLoaded(from, to) {
-  const r = state._loadedRange;
-  return !!(r && from >= r.from && to <= r.to);
-}
 
 function trendsDataExtentMin() {
   const t = todayKey();
-  return state.checkinBounds?.min || firstCycleStartKey() || t;
+  return state.entryBounds?.min || firstCycleStartKey() || t;
 }
 
 function trendsDataExtentMax() {
   const t = todayKey();
-  const mx = state.checkinBounds?.max || t;
+  const mx = state.entryBounds?.max || t;
   return mx > t ? t : mx;
 }
 
-/** Inclusive [lo, hi] for overlap checks (handles inverted min/max before first check-in). */
 function trendsDataSpan() {
   let lo = trendsDataExtentMin();
   let hi = trendsDataExtentMax();
-  if (lo > hi) {
-    const x = lo;
-    lo = hi;
-    hi = x;
-  }
+  if (lo > hi) { const x = lo; lo = hi; hi = x; }
   return { lo, hi };
 }
 
-function mondayOfWeekContaining(dateKey) {
-  const d = new Date(dateKey + 'T12:00:00');
-  const dow = (d.getDay() + 6) % 7;
-  d.setDate(d.getDate() - dow);
-  return fmtDate(d);
-}
-
-/** Inclusive date keys from..to. */
 export function enumerateDateKeys(from, to) {
   const out = [];
   let k = from;
-  while (k <= to) {
-    out.push(k);
-    k = addDaysKey(k, 1);
-  }
+  while (k <= to) { out.push(k); k = addDaysKey(k, 1); }
   return out;
 }
 
@@ -174,12 +155,6 @@ export function canTrendsNext() {
   return trendsPeriodOverlapsData(from, toN);
 }
 
-export function ensureTrendsRangeLoaded() {
-  const { from, to } = getTrendsRange();
-  if (rangeFullyLoaded(from, to)) return Promise.resolve();
-  return fetchCheckinsRange(from, to);
-}
-
 export function dayLabel(k) { return new Date(k + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' }).toUpperCase(); }
 export function escapeHtml(s) { return String(s).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;'); }
 export function showToast(msg) {
@@ -190,42 +165,17 @@ export function showToast(msg) {
   toastTimer = setTimeout(() => t.classList.add('hidden'), 2200);
 }
 
-function markCheckinDirty(dk) {
-  state._dirtyCheckinDates[dk] = true;
+function markEntryDirty(dk) {
+  state._dirtyEntryDates[dk] = true;
 }
 
-function markCheckinDeleted(dk) {
-  delete state._dirtyCheckinDates[dk];
-  if (!state._deletedCheckinDates.includes(dk)) state._deletedCheckinDates.push(dk);
+function markEntryDeleted(dk) {
+  delete state._dirtyEntryDates[dk];
+  if (!state._deletedEntryDates.includes(dk)) state._deletedEntryDates.push(dk);
 }
 
-function mergeLoadedRange(from, to) {
-  if (!state._loadedRange) state._loadedRange = { from, to };
-  else {
-    if (from < state._loadedRange.from) state._loadedRange.from = from;
-    if (to > state._loadedRange.to) state._loadedRange.to = to;
-  }
-}
-
-export async function fetchCheckinsRange(from, to) {
-  const url = SYNC_URL + '?from=' + encodeURIComponent(from) + '&to=' + encodeURIComponent(to);
-  const res = await fetch(url, { credentials: 'same-origin' });
-  if (!res.ok) throw new Error('range');
-  const data = await res.json();
-  if (!data || !Array.isArray(data.cycles)) return;
-  state.cycles = data.cycles;
-  state._lastModified = data._lastModified || state._lastModified;
-  Object.assign(state.checkinsByDate, data.checkinsByDate || {});
-  if (data.checkinBounds) state.checkinBounds = data.checkinBounds;
-  mergeLoadedRange(from, to);
-  sortCycles();
-}
-
-export function ensureDayLoadedThenRender() {
-  const dk = viewDayKey();
-  const r = state._loadedRange;
-  if (r && dk >= r.from && dk <= r.to) { render(); return; }
-  fetchCheckinsRange(dk, dk).then(() => render()).catch(() => { showToast('Could not load day'); render(); });
+function markCycleDirty(cycleId) {
+  state._dirtyCycleIds[cycleId] = true;
 }
 
 function makeDefaultCycle(startDate) {
@@ -234,26 +184,27 @@ function makeDefaultCycle(startDate) {
 }
 
 function initClean() {
-  state.checkinsByDate = {};
+  state.entriesByDate = {};
   state.cycles = [makeDefaultCycle(todayKey())];
   state.viewDate = todayKey();
-  state._dirtyCheckinDates = {};
-  state._deletedCheckinDates = [];
-  state._loadedRange = null;
-  state.checkinBounds = null;
+  state._dirtyCycleIds = {};
+  state._dirtyEntryDates = {};
+  state._deletedEntryDates = [];
+  state.entryBounds = null;
   state.trendsMode = 'cycle';
   state.trendsStep = 0;
   state.addHabitDraft = null;
 }
 
 /**
- * If check-ins exist before the first cycle starts, shift all cycles so the
- * first cycle starts on the earliest entered check-in date.
+ * If entries exist before the first cycle starts, shift all cycles so the
+ * first cycle starts on the earliest entered date. Marks each shifted cycle
+ * dirty so the boot-time normalization persists via per-cycle PUT.
  */
-export function normalizeFirstCycleStartFromCheckins() {
+export function normalizeFirstCycleStartFromEntries() {
   sortCycles();
   if (!state.cycles.length) return;
-  const dates = Object.keys(state.checkinsByDate || {});
+  const dates = Object.keys(state.entriesByDate || {});
   if (!dates.length) return;
   const first = state.cycles[0];
   const earliest = dates.reduce((m, d) => (d < m ? d : m), dates[0]);
@@ -266,13 +217,7 @@ export function normalizeFirstCycleStartFromCheckins() {
   for (const c of state.cycles) {
     c.startDate = addDaysKey(c.startDate, deltaDays);
     c.endDate = addDaysKey(c.endDate, deltaDays);
-  }
-}
-
-export function stripLegacyRestFromCheckins() {
-  for (const k of Object.keys(state.checkinsByDate)) {
-    const e = state.checkinsByDate[k];
-    if (e && Object.prototype.hasOwnProperty.call(e, 'isRestDay')) delete e.isRestDay;
+    markCycleDirty(c.id);
   }
 }
 
@@ -291,6 +236,7 @@ export function getCurrentCycle() {
     const s = addDaysKey(last.endDate, 1);
     const next = { id: uid('cycle'), startDate: s, endDate: addDaysKey(s, last.lengthDays - 1), lengthDays: last.lengthDays, categories: clone(last.categories), habitDefinitions: clone(last.habitDefinitions) };
     state.cycles.push(next);
+    markCycleDirty(next.id);
     last = next;
   }
   sortCycles();
@@ -305,13 +251,14 @@ export function getUpcomingCycle() {
     next = { id: uid('cycle'), startDate: nextStart, endDate: addDaysKey(nextStart, cur.lengthDays - 1), lengthDays: cur.lengthDays, categories: clone(cur.categories), habitDefinitions: clone(cur.habitDefinitions) };
     state.cycles.push(next);
     sortCycles();
+    markCycleDirty(next.id);
   }
   return next;
 }
 
 export function cycleForMode() {
-  if (!hasAnyCheckins()) return getCurrentCycle();
-  return state.tuneMode === 'next' ? getUpcomingCycle() : getCurrentCycle();
+  if (!hasAnyEntries()) return getCurrentCycle();
+  return state.planMode === 'next' ? getUpcomingCycle() : getCurrentCycle();
 }
 
 export function cycleInfo() {
@@ -321,31 +268,33 @@ export function cycleInfo() {
 }
 
 export function entryFor(dateKey) {
-  const raw = state.checkinsByDate[dateKey];
+  const raw = state.entriesByDate[dateKey];
   if (!raw) return { habitValuesById: {} };
   return { habitValuesById: raw.habitValuesById || {} };
 }
 
 export function putEntry(dateKey, entry) {
-  state.checkinsByDate[dateKey] = entry;
-  markCheckinDirty(dateKey);
+  state.entriesByDate[dateKey] = entry;
+  markEntryDirty(dateKey);
 }
 
-/** If no cycle still defines this habit id, remove its check-in values everywhere. */
-export function purgeOrphanHabitData(habitId) {
-  for (const c of state.cycles) {
-    if ((c.habitDefinitions || []).some(h => h.id === habitId)) return;
-  }
-  for (const dateKey of Object.keys(state.checkinsByDate)) {
-    const raw = state.checkinsByDate[dateKey];
+/**
+ * Mirror the server-side orphan sweep on the local cache so the next render shows
+ * the same thing the server has after it sweeps. Called on cycle PUT/DELETE response.
+ */
+export function applyOrphanSweepLocally(removedHabitIds) {
+  if (!removedHabitIds || !removedHabitIds.length) return;
+  const ids = new Set(removedHabitIds);
+  for (const dateKey of Object.keys(state.entriesByDate)) {
+    const raw = state.entriesByDate[dateKey];
     if (!raw || !raw.habitValuesById) continue;
-    if (!Object.prototype.hasOwnProperty.call(raw.habitValuesById, habitId)) continue;
-    delete raw.habitValuesById[habitId];
+    let changed = false;
+    for (const k of Object.keys(raw.habitValuesById)) {
+      if (ids.has(k)) { delete raw.habitValuesById[k]; changed = true; }
+    }
+    if (!changed) continue;
     if (Object.keys(raw.habitValuesById).length === 0) {
-      delete state.checkinsByDate[dateKey];
-      markCheckinDeleted(dateKey);
-    } else {
-      markCheckinDirty(dateKey);
+      delete state.entriesByDate[dateKey];
     }
   }
 }
@@ -359,14 +308,24 @@ export function categoryMax(cycle, cid) { return habitsForCategory(cycle, cid).r
 export function totalPoints(entry, cycle) { return (cycle.categories || []).reduce((s, c) => s + categoryPoints(entry, cycle, c.id), 0); }
 export function totalMax(cycle) { return (cycle.categories || []).reduce((s, c) => s + categoryMax(cycle, c.id), 0); }
 
-export function save() {
-  state._lastModified = Date.now();
-  schedulePushImpl();
+/** Flush a specific entry edit to the server. */
+export function pushEntry(dateKey) {
+  if (state.entriesByDate[dateKey] && Object.keys(state.entriesByDate[dateKey].habitValuesById || {}).length === 0) {
+    delete state.entriesByDate[dateKey];
+    markEntryDeleted(dateKey);
+  } else {
+    markEntryDirty(dateKey);
+  }
+  pushEntryImpl(dateKey);
 }
 
-export function load() {
-  initClean();
+/** Flush a specific cycle edit to the server. */
+export function pushCycle(cycleId) {
+  markCycleDirty(cycleId);
+  pushCycleImpl(cycleId);
 }
+
+export function load() { initClean(); }
 
 export function render() {
   if (!state.cloudReady) {
@@ -396,14 +355,13 @@ export function render() {
           ${syncPill}
         </div>
       </div>
-      ${state.tab === 'today' ? renderToday() : state.tab === 'trends' ? renderTrends() : renderTune()}
+      ${state.tab === 'entry' ? renderEntry() : state.tab === 'trends' ? renderTrends() : renderPlan()}
     </div>
     <nav class="tabs">
-      <button class="tab ${state.tab === 'today' ? 'active' : ''}" data-action="tab" data-tab="today">ENTRIES</button>
+      <button class="tab ${state.tab === 'entry' ? 'active' : ''}" data-action="tab" data-tab="entry">ENTRIES</button>
       <button class="tab ${state.tab === 'trends' ? 'active' : ''}" data-action="tab" data-tab="trends">TRENDS</button>
-      <button class="tab ${state.tab === 'tune' ? 'active' : ''}" data-action="tab" data-tab="tune">TUNE</button>
+      <button class="tab ${state.tab === 'plan' ? 'active' : ''}" data-action="tab" data-tab="plan">PLAN</button>
     </nav>
     ${state.addHabitDraft ? renderAddHabitModal() : ''}`;
   document.body.style.overflow = state.addHabitDraft ? 'hidden' : '';
 }
-

@@ -1,5 +1,5 @@
-import { setupHandlers } from './handlers.js?v=20260426-2128';
-import { initSync } from './sync.js?v=20260426-2128';
+import { setupHandlers } from './handlers.js?v=20260427-rename';
+import { initSync } from './sync.js?v=20260427-rename';
 
 setupHandlers();
 initSync();

@@ -27,15 +27,15 @@ export class GoodHabitTrackerStack extends cdk.Stack {
     }
     const cfSecret = crypto.createHash('sha256').update('cf-secret:' + unlockToken).digest('hex').slice(0, 32);
 
-    // ── DynamoDB: cycle definitions (date ranges, categories, habits/scoring) + daily check-ins ─
+    // ── DynamoDB: cycle definitions (date ranges, categories, habits/scoring) + per-day entries ─
     const cyclesTable = new dynamodb.Table(this, 'CyclesTable', {
       tableName: 'good-habit-tracker-cycles',
       partitionKey: { name: 'id', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
-    /** One partition `DAY`, sort key ISO date — supports Query by range (no full table Scans on read). */
-    const checkinsTable = new dynamodb.Table(this, 'CheckinsTable', {
+    /** One partition `DAY`, sort key ISO date — Query by range (no full table Scans on read). */
+    const entriesTable = new dynamodb.Table(this, 'CheckinsTable', {
       tableName: 'good-habit-tracker-day-checkins',
       partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'dateKey', type: dynamodb.AttributeType.STRING },
@@ -51,13 +51,13 @@ export class GoodHabitTrackerStack extends cdk.Stack {
       code: lambda.Code.fromAsset(path.join(__dirname, '../lambdas/sync')),
       environment: {
         CYCLES_TABLE_NAME: cyclesTable.tableName,
-        CHECKINS_TABLE_NAME: checkinsTable.tableName,
+        ENTRIES_TABLE_NAME: entriesTable.tableName,
         CF_SECRET: cfSecret,
       },
       timeout: cdk.Duration.seconds(45),
     });
     cyclesTable.grantReadWriteData(syncFn);
-    checkinsTable.grantReadWriteData(syncFn);
+    entriesTable.grantReadWriteData(syncFn);
 
     const syncUrl = syncFn.addFunctionUrl({ authType: lambda.FunctionUrlAuthType.NONE });
     const syncDomain = cdk.Fn.select(2, cdk.Fn.split('/', syncUrl.url));

@@ -7,7 +7,6 @@ import {
   escapeHtml,
   findCycleByDate,
   getTrendsRange,
-  rangeFullyLoaded,
   state,
   totalMax,
   totalPoints,
@@ -52,7 +51,6 @@ export function renderTrends() {
   const { from, to, label } = getTrendsRange();
   const days = enumerateDateKeys(from, to);
   const numDays = days.length || 1;
-  const loaded = rangeFullyLoaded(from, to);
   let sumPts = 0, sumMax = 0;
   for (const d of days) {
     sumPts += ptsFor(d);
@@ -66,14 +64,11 @@ export function renderTrends() {
   const mode = state.trendsMode;
   const prevOk = canTrendsPrev();
   const nextOk = canTrendsNext();
-  const metricsBlock = loaded
-    ? `<div class="grid-metrics">
+  const metricsBlock = `<div class="grid-metrics">
       <div class="card"><div class="mono muted">POINTS</div><div class="stat" style="font-size:24px">${sumPts}</div><div class="mono muted">/ ${sumMax}</div></div>
       <div class="card"><div class="mono muted">AVG / DAY</div><div class="stat" style="font-size:24px">${avgPerDay.toFixed(1)}</div><div class="mono muted">pts</div></div>
-    </div>`
-    : `<div class="card"><div class="muted" style="font-size:14px;line-height:1.45">Loading check-ins for <span class="mono">${from}</span> → <span class="mono">${to}</span>…</div></div>`;
-  const chartsBlock = loaded
-    ? `<div class="card">
+    </div>`;
+  const chartsBlock = `<div class="card">
         <div class="row between" style="margin-bottom:8px;gap:8px;align-items:baseline">
           <div class="mono muted">TOTAL POINTS (${days.length}D)</div>
           <div class="mono muted" style="font-size:11px">avg ${avgPerDay.toFixed(1)} pts/day</div>
@@ -86,8 +81,7 @@ export function renderTrends() {
           <div class="mono muted" style="font-size:11px">avg ${avgPctPerDay.toFixed(1)}%</div>
         </div>
         ${buildLineChart(chartDataPct, avgPctPerDay, 100)}
-      </div>`
-    : '<div class="card"><div class="muted" style="padding:12px 0">Charts appear once this range is loaded.</div></div>';
+      </div>`;
   return `
     <div class="row" style="margin-bottom:12px;flex-wrap:wrap;gap:8px">
       <button class="btn ${mode === 'cycle' ? 'primary' : ''}" type="button" data-action="trends-mode" data-mode="cycle">CYCLE</button>

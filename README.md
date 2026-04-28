@@ -6,10 +6,10 @@ Single-page **habit tracker** (vanilla HTML/JS) with **AWS CDK** infrastructure:
 
 ## Features
 
-- User-defined categories and habits, points per habit, 14-day cycles (tunable)
-- Today / trends / tune tabs
-- Cloud-only persistence (`GET` / `POST /api/sync`); no tracker data in `localStorage`
-- DynamoDB: cycle row + per-day check-ins (range `GET /api/sync?from=&to=`), partial `POST` for edits
+- User-defined categories and habits, points per habit, 14-day cycles (length is configurable)
+- Entry / trends / plan tabs
+- Cloud-only persistence via per-item REST (`/api/cycles`, `/api/entries`); no tracker data in `localStorage`
+- DynamoDB: cycles row + per-day entries; reads are partition-targeted Query / GetItem (no Scans, no date-range parameters)
 
 ## Repository layout
 

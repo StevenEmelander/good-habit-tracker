@@ -3,6 +3,7 @@ const {
   DynamoDBClient,
   GetItemCommand,
   PutItemCommand,
+  UpdateItemCommand,
   QueryCommand,
   DeleteItemCommand,
   BatchWriteItemCommand,
@@ -10,122 +11,157 @@ const {
 
 const client = new DynamoDBClient({});
 const CYCLES_TABLE = process.env.CYCLES_TABLE_NAME;
-const CHECKINS_TABLE = process.env.CHECKINS_TABLE_NAME;
+const ENTRIES_TABLE = process.env.ENTRIES_TABLE_NAME;
 const CF_SECRET = process.env.CF_SECRET;
 const CYCLES_ROW_ID = 'main';
-const CHECKIN_PK = 'DAY';
+const ENTRY_PK = 'DAY';
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function nowIso() { return new Date().toISOString(); }
 
-function parseQuery(qs) {
-  const o = {};
-  if (!qs) return o;
-  for (const part of String(qs).split('&')) {
-    const i = part.indexOf('=');
-    if (i < 0) continue;
-    const k = decodeURIComponent(part.slice(0, i));
-    const v = decodeURIComponent(part.slice(i + 1));
-    o[k] = v;
-  }
-  return o;
-}
-
-function todayIsoUtc() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function addDaysIso(iso, delta) {
-  const [y, m, d] = iso.split('-').map(Number);
-  const t = new Date(Date.UTC(y, m - 1, d) + delta * 86400000);
-  return t.toISOString().slice(0, 10);
-}
-
-async function queryCheckinsBetween(from, to) {
-  const checkinsByDate = {};
-  let ExclusiveStartKey;
-  do {
-    const out = await client.send(
-      new QueryCommand({
-        TableName: CHECKINS_TABLE,
-        KeyConditionExpression: '#p = :p AND #d BETWEEN :f AND :t',
-        ExpressionAttributeNames: { '#p': 'pk', '#d': 'dateKey' },
-        ExpressionAttributeValues: {
-          ':p': { S: CHECKIN_PK },
-          ':f': { S: from },
-          ':t': { S: to },
-        },
-        ProjectionExpression: 'dateKey, habitValuesJson',
-        ExclusiveStartKey,
-      }),
-    );
-    for (const it of out.Items || []) {
-      const dk = it.dateKey && it.dateKey.S;
-      if (!dk) continue;
-      let habitValuesById = {};
-      if (it.habitValuesJson && it.habitValuesJson.S) {
-        try {
-          habitValuesById = JSON.parse(it.habitValuesJson.S);
-          if (!habitValuesById || typeof habitValuesById !== 'object') habitValuesById = {};
-        } catch {
-          habitValuesById = {};
-        }
-      }
-      checkinsByDate[dk] = { habitValuesById };
-    }
-    ExclusiveStartKey = out.LastEvaluatedKey;
-  } while (ExclusiveStartKey);
-  return checkinsByDate;
-}
-
-/** All date keys under CHECKIN_PK (for bounds + full replace cleanup). */
-async function queryAllCheckinDateKeys() {
-  const keys = [];
-  let ExclusiveStartKey;
-  do {
-    const out = await client.send(
-      new QueryCommand({
-        TableName: CHECKINS_TABLE,
-        KeyConditionExpression: '#p = :p AND #d BETWEEN :lo AND :hi',
-        ExpressionAttributeNames: { '#p': 'pk', '#d': 'dateKey' },
-        ExpressionAttributeValues: {
-          ':p': { S: CHECKIN_PK },
-          ':lo': { S: '1970-01-01' },
-          ':hi': { S: '2099-12-31' },
-        },
-        ProjectionExpression: 'dateKey',
-        ExclusiveStartKey,
-      }),
-    );
-    for (const it of out.Items || []) {
-      if (it.dateKey && it.dateKey.S) keys.push(it.dateKey.S);
-    }
-    ExclusiveStartKey = out.LastEvaluatedKey;
-  } while (ExclusiveStartKey);
-  return keys;
-}
-
-/** Returns { min, max } ISO date strings or nulls. */
-async function computeCheckinBounds() {
-  const keys = await queryAllCheckinDateKeys();
-  keys.sort();
+function jsonResponse(statusCode, obj) {
   return {
-    min: keys.length ? keys[0] : null,
-    max: keys.length ? keys[keys.length - 1] : null,
+    statusCode,
+    headers: { 'Content-Type': 'application/json' },
+    body: typeof obj === 'string' ? obj : JSON.stringify(obj),
+  };
+}
+function plainResponse(statusCode, text) {
+  return { statusCode, headers: { 'Content-Type': 'text/plain' }, body: text };
+}
+
+function getBody(event) {
+  const raw = event.isBase64Encoded
+    ? Buffer.from(event.body || '', 'base64').toString('utf8')
+    : (event.body || '');
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return undefined; }
+}
+
+function safeJsonParseObject(s) {
+  if (!s) return {};
+  try { const v = JSON.parse(s); return v && typeof v === 'object' ? v : {}; } catch { return {}; }
+}
+
+function isValidDateKey(s) { return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s); }
+
+// ── Cycles row (single DynamoDB item holding all cycle definitions) ─────
+
+async function getCyclesRow() {
+  const out = await client.send(new GetItemCommand({
+    TableName: CYCLES_TABLE,
+    Key: { id: { S: CYCLES_ROW_ID } },
+  }));
+  return out.Item || null;
+}
+
+function parseCycles(item) {
+  if (!item || !item.cyclesJson) return [];
+  try {
+    const v = JSON.parse(item.cyclesJson.S);
+    return Array.isArray(v) ? v : [];
+  } catch { return []; }
+}
+
+function parseBounds(item) {
+  return {
+    min: item && item.entryDateMin ? item.entryDateMin.S : null,
+    max: item && item.entryDateMax ? item.entryDateMax.S : null,
   };
 }
 
-async function batchWriteCheckins(puts) {
-  for (let i = 0; i < puts.length; i += 25) {
-    let batch = puts.slice(i, i + 25);
+async function writeCycles(cycles, bounds) {
+  const item = {
+    id: { S: CYCLES_ROW_ID },
+    cyclesJson: { S: JSON.stringify(cycles) },
+    updatedAt: { S: nowIso() },
+  };
+  if (bounds && bounds.min) item.entryDateMin = { S: bounds.min };
+  if (bounds && bounds.max) item.entryDateMax = { S: bounds.max };
+  await client.send(new PutItemCommand({ TableName: CYCLES_TABLE, Item: item }));
+}
+
+// ── Entries (one DynamoDB item per day) ─────────────────────────────────
+
+async function getEntry(dateKey) {
+  const out = await client.send(new GetItemCommand({
+    TableName: ENTRIES_TABLE,
+    Key: { pk: { S: ENTRY_PK }, dateKey: { S: dateKey } },
+  }));
+  if (!out.Item) return null;
+  const raw = (out.Item.valuesJson && out.Item.valuesJson.S)
+    || (out.Item.habitValuesJson && out.Item.habitValuesJson.S)
+    || '';
+  return { dateKey, habitValuesById: safeJsonParseObject(raw) };
+}
+
+async function putEntryRow(dateKey, habitValuesById) {
+  await client.send(new PutItemCommand({
+    TableName: ENTRIES_TABLE,
+    Item: {
+      pk: { S: ENTRY_PK },
+      dateKey: { S: dateKey },
+      valuesJson: { S: JSON.stringify(habitValuesById || {}) },
+      updatedAt: { S: nowIso() },
+    },
+  }));
+}
+
+async function deleteEntryRow(dateKey) {
+  await client.send(new DeleteItemCommand({
+    TableName: ENTRIES_TABLE,
+    Key: { pk: { S: ENTRY_PK }, dateKey: { S: dateKey } },
+  }));
+}
+
+/** Query pk='DAY'. No SK condition → returns the entire entry set in one paginated call. */
+async function queryAllEntries() {
+  const out = {};
+  let ExclusiveStartKey;
+  do {
+    const resp = await client.send(new QueryCommand({
+      TableName: ENTRIES_TABLE,
+      KeyConditionExpression: '#p = :p',
+      ExpressionAttributeNames: { '#p': 'pk' },
+      ExpressionAttributeValues: { ':p': { S: ENTRY_PK } },
+      ProjectionExpression: 'dateKey, valuesJson, habitValuesJson',
+      ExclusiveStartKey,
+    }));
+    for (const it of resp.Items || []) {
+      const dk = it.dateKey && it.dateKey.S;
+      if (!dk) continue;
+      const raw = (it.valuesJson && it.valuesJson.S)
+        || (it.habitValuesJson && it.habitValuesJson.S)
+        || '';
+      out[dk] = safeJsonParseObject(raw);
+    }
+    ExclusiveStartKey = resp.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  return out;
+}
+
+async function findBoundEntry(direction) {
+  const resp = await client.send(new QueryCommand({
+    TableName: ENTRIES_TABLE,
+    KeyConditionExpression: '#p = :p',
+    ExpressionAttributeNames: { '#p': 'pk' },
+    ExpressionAttributeValues: { ':p': { S: ENTRY_PK } },
+    ProjectionExpression: 'dateKey',
+    ScanIndexForward: direction === 'asc',
+    Limit: 1,
+  }));
+  const it = (resp.Items || [])[0];
+  return it && it.dateKey ? it.dateKey.S : null;
+}
+
+async function batchWriteEntries(requests) {
+  for (let i = 0; i < requests.length; i += 25) {
+    let batch = requests.slice(i, i + 25);
     for (let attempt = 0; attempt < 12; attempt++) {
-      const res = await client.send(
-        new BatchWriteItemCommand({
-          RequestItems: { [CHECKINS_TABLE]: batch },
-        }),
-      );
-      const un = res.UnprocessedItems && res.UnprocessedItems[CHECKINS_TABLE];
+      const res = await client.send(new BatchWriteItemCommand({
+        RequestItems: { [ENTRIES_TABLE]: batch },
+      }));
+      const un = res.UnprocessedItems && res.UnprocessedItems[ENTRIES_TABLE];
       if (!un || un.length === 0) break;
       batch = un;
       await sleep(40 * (attempt + 1));
@@ -133,155 +169,230 @@ async function batchWriteCheckins(puts) {
   }
 }
 
+/** Update only entryDateMin/Max on the cycles row, leaving cyclesJson untouched. */
+async function bumpBoundsOnPut(dateKey) {
+  await client.send(new UpdateItemCommand({
+    TableName: CYCLES_TABLE,
+    Key: { id: { S: CYCLES_ROW_ID } },
+    UpdateExpression:
+      'SET entryDateMin = if_not_exists(entryDateMin, :d), entryDateMax = if_not_exists(entryDateMax, :d), updatedAt = :u',
+    ExpressionAttributeValues: { ':d': { S: dateKey }, ':u': { S: nowIso() } },
+  }));
+  // Two follow-up updates extend the bounds outward only when needed.
+  await client.send(new UpdateItemCommand({
+    TableName: CYCLES_TABLE,
+    Key: { id: { S: CYCLES_ROW_ID } },
+    UpdateExpression: 'SET entryDateMin = :d',
+    ConditionExpression: 'attribute_not_exists(entryDateMin) OR :d < entryDateMin',
+    ExpressionAttributeValues: { ':d': { S: dateKey } },
+  })).catch(() => {});
+  await client.send(new UpdateItemCommand({
+    TableName: CYCLES_TABLE,
+    Key: { id: { S: CYCLES_ROW_ID } },
+    UpdateExpression: 'SET entryDateMax = :d',
+    ConditionExpression: 'attribute_not_exists(entryDateMax) OR :d > entryDateMax',
+    ExpressionAttributeValues: { ':d': { S: dateKey } },
+  })).catch(() => {});
+}
+
+async function recomputeBoundsAfterDelete(deletedDateKey) {
+  const row = await getCyclesRow();
+  const bounds = parseBounds(row);
+  let { min, max } = bounds;
+  let changed = false;
+  if (deletedDateKey === min) { min = await findBoundEntry('asc'); changed = true; }
+  if (deletedDateKey === max) { max = await findBoundEntry('desc'); changed = true; }
+  if (!changed) return;
+  const expr = [];
+  const removeExpr = [];
+  const vals = { ':u': { S: nowIso() } };
+  if (min) { expr.push('entryDateMin = :mn'); vals[':mn'] = { S: min }; }
+  else removeExpr.push('entryDateMin');
+  if (max) { expr.push('entryDateMax = :mx'); vals[':mx'] = { S: max }; }
+  else removeExpr.push('entryDateMax');
+  expr.push('updatedAt = :u');
+  let UpdateExpression = 'SET ' + expr.join(', ');
+  if (removeExpr.length) UpdateExpression += ' REMOVE ' + removeExpr.join(', ');
+  await client.send(new UpdateItemCommand({
+    TableName: CYCLES_TABLE,
+    Key: { id: { S: CYCLES_ROW_ID } },
+    UpdateExpression,
+    ExpressionAttributeValues: vals,
+  }));
+}
+
+// ── Orphan-habit sweep ──────────────────────────────────────────────────
+
+async function sweepOrphanHabits(cycles) {
+  const liveIds = new Set();
+  for (const c of cycles) {
+    for (const h of (c.habitDefinitions || [])) if (h && h.id) liveIds.add(h.id);
+  }
+  const allEntries = await queryAllEntries();
+  const requests = [];
+  const removedIds = new Set();
+  let boundsDirty = false;
+  for (const dk of Object.keys(allEntries)) {
+    const values = allEntries[dk];
+    let changed = false;
+    for (const k of Object.keys(values)) {
+      if (!liveIds.has(k)) { delete values[k]; changed = true; removedIds.add(k); }
+    }
+    if (!changed) continue;
+    if (Object.keys(values).length === 0) {
+      requests.push({ DeleteRequest: { Key: { pk: { S: ENTRY_PK }, dateKey: { S: dk } } } });
+      boundsDirty = true;
+    } else {
+      requests.push({ PutRequest: { Item: {
+        pk: { S: ENTRY_PK },
+        dateKey: { S: dk },
+        valuesJson: { S: JSON.stringify(values) },
+        updatedAt: { S: nowIso() },
+      } } });
+    }
+  }
+  if (requests.length) await batchWriteEntries(requests);
+  if (boundsDirty) {
+    const min = await findBoundEntry('asc');
+    const max = await findBoundEntry('desc');
+    const expr = [];
+    const removeExpr = [];
+    const vals = { ':u': { S: nowIso() } };
+    if (min) { expr.push('entryDateMin = :mn'); vals[':mn'] = { S: min }; }
+    else removeExpr.push('entryDateMin');
+    if (max) { expr.push('entryDateMax = :mx'); vals[':mx'] = { S: max }; }
+    else removeExpr.push('entryDateMax');
+    expr.push('updatedAt = :u');
+    let UpdateExpression = 'SET ' + expr.join(', ');
+    if (removeExpr.length) UpdateExpression += ' REMOVE ' + removeExpr.join(', ');
+    await client.send(new UpdateItemCommand({
+      TableName: CYCLES_TABLE,
+      Key: { id: { S: CYCLES_ROW_ID } },
+      UpdateExpression,
+      ExpressionAttributeValues: vals,
+    }));
+  }
+  return [...removedIds];
+}
+
+// ── Route handlers ──────────────────────────────────────────────────────
+
+async function handleListCycles() {
+  const row = await getCyclesRow();
+  const cycles = parseCycles(row);
+  const entryBounds = parseBounds(row);
+  return jsonResponse(200, { cycles, entryBounds });
+}
+
+async function handleGetCycle(cycleId) {
+  if (!cycleId) return plainResponse(400, 'Invalid cycleId');
+  const row = await getCyclesRow();
+  const cycles = parseCycles(row);
+  const found = cycles.find((c) => c && c.id === cycleId);
+  if (!found) return plainResponse(404, 'Not Found');
+  return jsonResponse(200, found);
+}
+
+async function handlePutCycle(cycleId, body) {
+  if (!cycleId) return plainResponse(400, 'Invalid cycleId');
+  if (!body || typeof body !== 'object') return plainResponse(400, 'Invalid body');
+  const next = { ...body, id: cycleId };
+  if (!isValidDateKey(next.startDate) || !isValidDateKey(next.endDate)) {
+    return plainResponse(400, 'Invalid dates');
+  }
+  const row = await getCyclesRow();
+  const cycles = parseCycles(row);
+  const idx = cycles.findIndex((c) => c && c.id === cycleId);
+  if (idx >= 0) cycles[idx] = next;
+  else cycles.push(next);
+  cycles.sort((a, b) => String(a.startDate).localeCompare(String(b.startDate)));
+  await writeCycles(cycles, parseBounds(row));
+  const removedHabitIds = await sweepOrphanHabits(cycles);
+  return jsonResponse(200, { ok: true, removedHabitIds });
+}
+
+async function handleDeleteCycle(cycleId) {
+  if (!cycleId) return plainResponse(400, 'Invalid cycleId');
+  const row = await getCyclesRow();
+  const cycles = parseCycles(row).filter((c) => c && c.id !== cycleId);
+  await writeCycles(cycles, parseBounds(row));
+  const removedHabitIds = await sweepOrphanHabits(cycles);
+  return jsonResponse(200, { ok: true, removedHabitIds });
+}
+
+async function handleListEntries() {
+  const entries = await queryAllEntries();
+  return jsonResponse(200, { entries });
+}
+
+async function handleGetEntry(dateKey) {
+  if (!isValidDateKey(dateKey)) return plainResponse(400, 'Invalid dateKey');
+  const e = await getEntry(dateKey);
+  if (!e) return plainResponse(404, 'Not Found');
+  return jsonResponse(200, e);
+}
+
+async function handlePutEntry(dateKey, body) {
+  if (!isValidDateKey(dateKey)) return plainResponse(400, 'Invalid dateKey');
+  if (!body || typeof body !== 'object') return plainResponse(400, 'Invalid body');
+  const values = body.habitValuesById && typeof body.habitValuesById === 'object'
+    ? body.habitValuesById
+    : {};
+  if (Object.keys(values).length === 0) {
+    await deleteEntryRow(dateKey);
+    await recomputeBoundsAfterDelete(dateKey);
+    return jsonResponse(200, { ok: true, deleted: true });
+  }
+  await putEntryRow(dateKey, values);
+  await bumpBoundsOnPut(dateKey);
+  return jsonResponse(200, { ok: true });
+}
+
+async function handleDeleteEntry(dateKey) {
+  if (!isValidDateKey(dateKey)) return plainResponse(400, 'Invalid dateKey');
+  await deleteEntryRow(dateKey);
+  await recomputeBoundsAfterDelete(dateKey);
+  return jsonResponse(200, { ok: true });
+}
+
+// ── Router ──────────────────────────────────────────────────────────────
+
+function matchPath(path) {
+  if (!path) return null;
+  if (path === '/api/cycles') return { kind: 'cycles-list' };
+  if (path === '/api/entries') return { kind: 'entries-list' };
+  let m = path.match(/^\/api\/cycles\/([^/]+)$/);
+  if (m) return { kind: 'cycle-item', cycleId: decodeURIComponent(m[1]) };
+  m = path.match(/^\/api\/entries\/([^/]+)$/);
+  if (m) return { kind: 'entry-item', dateKey: decodeURIComponent(m[1]) };
+  return null;
+}
+
 exports.handler = async (event) => {
   const headers = event.headers || {};
   if (!CF_SECRET || headers['x-cf-secret'] !== CF_SECRET) {
-    return { statusCode: 403, body: 'Forbidden' };
+    return plainResponse(403, 'Forbidden');
   }
+  const method = (event.requestContext && event.requestContext.http && event.requestContext.http.method) || 'GET';
+  const path = (event.requestContext && event.requestContext.http && event.requestContext.http.path) || event.rawPath || '';
+  const route = matchPath(path);
+  if (!route) return plainResponse(404, 'Not Found');
 
-  const method =
-    (event.requestContext && event.requestContext.http && event.requestContext.http.method) || 'GET';
-  const rawQuery = event.rawQueryString || '';
-
-  if (method === 'GET') {
-    const progRes = await client.send(
-      new GetItemCommand({
-        TableName: CYCLES_TABLE,
-        Key: { id: { S: CYCLES_ROW_ID } },
-      }),
-    );
-    if (!progRes.Item || !progRes.Item.cyclesJson) {
-      return {
-        statusCode: 200,
-        headers: { 'Content-Type': 'application/json' },
-        body: 'null',
-      };
+  try {
+    if (route.kind === 'cycles-list' && method === 'GET') return await handleListCycles();
+    if (route.kind === 'cycle-item') {
+      if (method === 'GET') return await handleGetCycle(route.cycleId);
+      if (method === 'PUT') return await handlePutCycle(route.cycleId, getBody(event));
+      if (method === 'DELETE') return await handleDeleteCycle(route.cycleId);
     }
-    let cycles;
-    try {
-      cycles = JSON.parse(progRes.Item.cyclesJson.S);
-      if (!Array.isArray(cycles)) throw new Error('bad cycles');
-    } catch {
-      return {
-        statusCode: 200,
-        headers: { 'Content-Type': 'application/json' },
-        body: 'null',
-      };
+    if (route.kind === 'entries-list' && method === 'GET') return await handleListEntries();
+    if (route.kind === 'entry-item') {
+      if (method === 'GET') return await handleGetEntry(route.dateKey);
+      if (method === 'PUT') return await handlePutEntry(route.dateKey, getBody(event));
+      if (method === 'DELETE') return await handleDeleteEntry(route.dateKey);
     }
-    const _lastModified = progRes.Item._lastModified ? Number(progRes.Item._lastModified.N) : 0;
-    const q = parseQuery(rawQuery);
-    let from = q.from;
-    let to = q.to;
-    if (!from || !to) {
-      to = todayIsoUtc();
-      from = addDaysIso(to, -730);
-    }
-    if (from > to) {
-      const x = from;
-      from = to;
-      to = x;
-    }
-    const checkinsByDate = await queryCheckinsBetween(from, to);
-    const checkinBounds = {
-      min: progRes.Item.checkinDateMin ? progRes.Item.checkinDateMin.S : null,
-      max: progRes.Item.checkinDateMax ? progRes.Item.checkinDateMax.S : null,
-    };
-    const body = JSON.stringify({
-      checkinsByDate,
-      cycles,
-      _lastModified,
-      checkinBounds,
-    });
-    return {
-      statusCode: 200,
-      headers: { 'Content-Type': 'application/json' },
-      body,
-    };
+    return plainResponse(405, 'Method Not Allowed');
+  } catch (err) {
+    return jsonResponse(500, { error: 'internal', message: String(err && err.message || err) });
   }
-
-  if (method === 'POST') {
-    const raw = event.isBase64Encoded
-      ? Buffer.from(event.body, 'base64').toString('utf8')
-      : event.body || '{}';
-    let doc;
-    try {
-      doc = JSON.parse(raw);
-    } catch {
-      return { statusCode: 400, body: 'Invalid JSON' };
-    }
-    if (!Array.isArray(doc.cycles)) {
-      return { statusCode: 400, body: 'Invalid payload' };
-    }
-    const _lastModified = Number(doc._lastModified) || Date.now();
-    const updatedAt = new Date().toISOString();
-    const partial = !!doc.partial;
-    const checkinsByDate =
-      doc.checkinsByDate && typeof doc.checkinsByDate === 'object' ? doc.checkinsByDate : {};
-    const deletedCheckinDates = Array.isArray(doc.deletedCheckinDates)
-      ? doc.deletedCheckinDates.filter((x) => typeof x === 'string')
-      : [];
-
-    for (const dk of deletedCheckinDates) {
-      await client.send(
-        new DeleteItemCommand({
-          TableName: CHECKINS_TABLE,
-          Key: { pk: { S: CHECKIN_PK }, dateKey: { S: dk } },
-        }),
-      );
-    }
-
-    const puts = [];
-    for (const dateKey of Object.keys(checkinsByDate)) {
-      const entry = checkinsByDate[dateKey];
-      const hv =
-        entry && entry.habitValuesById && typeof entry.habitValuesById === 'object'
-          ? entry.habitValuesById
-          : {};
-      puts.push({
-        PutRequest: {
-          Item: {
-            pk: { S: CHECKIN_PK },
-            dateKey: { S: dateKey },
-            habitValuesJson: { S: JSON.stringify(hv) },
-            updatedAt: { S: updatedAt },
-          },
-        },
-      });
-    }
-    if (puts.length) await batchWriteCheckins(puts);
-
-    if (!partial) {
-      const keysInPayload = new Set(Object.keys(checkinsByDate));
-      const allKeys = await queryAllCheckinDateKeys();
-      for (const dk of allKeys) {
-        if (!keysInPayload.has(dk)) {
-          await client.send(
-            new DeleteItemCommand({
-              TableName: CHECKINS_TABLE,
-              Key: { pk: { S: CHECKIN_PK }, dateKey: { S: dk } },
-            }),
-          );
-        }
-      }
-    }
-
-    const { min, max } = await computeCheckinBounds();
-    const cyclesItem = {
-      id: { S: CYCLES_ROW_ID },
-      cyclesJson: { S: JSON.stringify(doc.cycles) },
-      _lastModified: { N: String(_lastModified) },
-      updatedAt: { S: updatedAt },
-    };
-    if (min) cyclesItem.checkinDateMin = { S: min };
-    if (max) cyclesItem.checkinDateMax = { S: max };
-    await client.send(new PutItemCommand({ TableName: CYCLES_TABLE, Item: cyclesItem }));
-
-    return {
-      statusCode: 200,
-      headers: { 'Content-Type': 'application/json' },
-      body: '{"ok":true}',
-    };
-  }
-
-  return { statusCode: 405, body: 'Method Not Allowed' };
 };
