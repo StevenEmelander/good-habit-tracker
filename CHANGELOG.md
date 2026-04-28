@@ -25,7 +25,7 @@ All notable changes to this project are documented here.
 - **Legacy front-end paths**: `schedulePush`, `purgeOrphanHabitData` (now server-side), `_loadedRange`, `ensureDayLoadedThenRender`, `ensureTrendsRangeLoaded`, `fetchCheckinsRange`, `rangeFullyLoaded`, `stripLegacyRestFromCheckins`. The orphan-`isRestDay` cleanup is no longer needed.
 - **Legacy DynamoDB attribute** `_lastModified` on the cycles row.
 
-## [0.2.0] - 2026-04-27
+## [0.2] - 2026-04-27
 
 ### Added
 
